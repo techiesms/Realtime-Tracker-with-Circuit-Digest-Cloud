@@ -156,6 +156,9 @@ const unsigned long MAX_CALL_DURATION = 120;
 const int MIC_GAIN = 5;
 String incomingCallerID = "";
 unsigned long callAnsweredAt = 0;
+int ringCount = 0;
+unsigned long lastRingTime = 0;
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HTML — Config Portal
@@ -628,14 +631,16 @@ void loop() {
 
   processSMS();
 
+  // ── Geolinker upload — ONE block, NEVER during a call ────────────────────
+  if (!callInProgress && gpsFixed && gprsConnected && (millis() - lastGeolinkerUpload > geolinkerUploadInterval)) {
+    sendToGeolinkerViaGPRS();
+    lastGeolinkerUpload = millis();
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   if (millis() - lastGSMCheck > gsmCheckInterval) {
     checkGSMStatus();
     lastGSMCheck = millis();
-  }
-
-  if (gpsFixed && gprsConnected && (millis() - lastGeolinkerUpload > geolinkerUploadInterval)) {
-    sendToGeolinkerViaGPRS();
-    lastGeolinkerUpload = millis();
   }
 
   if (millis() - lastGPSPrint > gpsPrintInterval) {
@@ -911,66 +916,110 @@ void sendStartupSMS() {
   }
   markStartupSMSSent();
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Incoming call / SMS processing  ← UNCHANGED FROM ORIGINAL
+// Incoming call / SMS processing
 // ─────────────────────────────────────────────────────────────────────────────
 void processSMS() {
   static String currentLine = "";
   static String smsFull = "";
 
+  // Reset ring count if no RING seen for 10 seconds (stale call cleanup)
+  if (ringCount > 0 && (millis() - lastRingTime) > 10000) {
+    Serial.println("Ring timeout — resetting ring count");
+    ringCount = 0;
+    incomingCallerID = "";
+  }
+
   while (GSMSerial.available()) {
     char c = GSMSerial.read();
+
+    // Ignore bare \r characters
+    if (c == '\r') continue;
+
     if (c == '\n') {
       currentLine.trim();
 
+      // ── Skip empty lines UNLESS we are collecting an SMS body ──────────────
+      if (currentLine.length() == 0) {
+        // If we have an SMS header waiting, a blank line is just whitespace noise
+        // keep smsFull intact so the real body line is caught below
+        currentLine = "";
+        continue;
+      }
+
+      // ── RING ────────────────────────────────────────────────────────────────
       if (currentLine.indexOf("RING") != -1 && !callInProgress) {
-        Serial.println("Incoming call...");
-        incomingCallerID = "Unknown";
+        ringCount++;
+        lastRingTime = millis();
+        Serial.println("RING #" + String(ringCount) + " | caller so far: " + incomingCallerID);
+
+        // Answer on 2nd RING — gives SIM800L ~5 s to deliver +CLIP: on 1st RING.
+        // If +CLIP: already arrived and answered us, ringCount was reset to 0,
+        // so this branch won't double-answer.
+        if (ringCount >= 2) {
+          Serial.println("No +CLIP received — answering on RING #" + String(ringCount));
+          handleIncomingCall(incomingCallerID);  // incomingCallerID may be "Unknown"
+          ringCount = 0;
+        }
+
+        // ── +CLIP: caller ID ────────────────────────────────────────────────────
       } else if (currentLine.startsWith("+CLIP:")) {
         int q1 = currentLine.indexOf('"');
         int q2 = currentLine.indexOf('"', q1 + 1);
-        if (q1 != -1 && q2 != -1) incomingCallerID = currentLine.substring(q1 + 1, q2);
-        Serial.println("Caller: " + incomingCallerID);
-        handleIncomingCall(incomingCallerID);
-      } else if (currentLine.indexOf("NO CARRIER") != -1 || currentLine.indexOf("BUSY") != -1) {
+        if (q1 != -1 && q2 != -1) {
+          incomingCallerID = currentLine.substring(q1 + 1, q2);
+        }
+        Serial.println("Caller ID: " + incomingCallerID);
+
+        // Answer now — +CLIP arrived before the 2nd RING fired
+        if (!callInProgress) {
+          handleIncomingCall(incomingCallerID);
+          ringCount = 0;  // prevent RING branch from answering again
+        }
+
+        // ── Call ended by remote ────────────────────────────────────────────────
+      } else if (currentLine.indexOf("NO CARRIER") != -1 || currentLine.indexOf("BUSY") != -1 || currentLine.indexOf("NO ANSWER") != -1) {
         if (callInProgress) {
           callInProgress = false;
           callAnsweredAt = 0;
           incomingCallerID = "";
+          ringCount = 0;
           digitalWrite(sosStatusLED, LOW);
           Serial.println("Call ended by remote");
-        }
-      } else if (currentLine.startsWith("+CMT:")) {
-        // +CMT: header line arrived — save it and wait for the body on next line
-        smsFull = currentLine + "\n";
-        Serial.println("SMS header captured: " + currentLine);
-      } else if (smsFull.length() > 0) {
-        // This is the SMS body line that follows the +CMT: header
-        // Skip blank lines (pure \r artifacts) and keep waiting
-        if (currentLine.length() < 2) {
-          // blank — do nothing, keep smsFull so next non-blank line is the body
         } else {
-          smsFull += currentLine + "\n";
-          Serial.println("SMS body captured: " + currentLine);
-          processIncomingSMS(smsFull);
-          smsFull = "";
+          // Missed call (never answered) — still clean up
+          ringCount = 0;
+          incomingCallerID = "";
+          Serial.println("Missed / rejected call — cleaned up");
         }
+
+        // ── +CMT: SMS header ────────────────────────────────────────────────────
+      } else if (currentLine.startsWith("+CMT:")) {
+        smsFull = currentLine + "\n";
+        Serial.println("SMS header: " + currentLine);
+
+        // ── SMS body (line after +CMT:) ─────────────────────────────────────────
+      } else if (smsFull.length() > 0) {
+        // currentLine is non-empty here (empty lines skipped above)
+        smsFull += currentLine + "\n";
+        Serial.println("SMS body: " + currentLine);
+        processIncomingSMS(smsFull);
+        smsFull = "";
       }
 
       currentLine = "";
+
     } else {
       currentLine += c;
     }
   }
 
-  // Auto-hangup
+  // ── Auto-hangup after MAX_CALL_DURATION seconds ───────────────────────────
   if (callInProgress && MAX_CALL_DURATION > 0 && (millis() - callAnsweredAt) >= (MAX_CALL_DURATION * 1000UL)) {
-    Serial.println("Max duration – hanging up");
+    Serial.println("Max call duration reached — hanging up");
     hangupCall();
   }
 }
-
 void handleIncomingCall(String caller) {
   if (callInProgress) return;
   bool answer = false;
@@ -1005,7 +1054,7 @@ void answerCall() {
   delay(300);
   GSMSerial.println("AT+CSIDET=1");
   delay(300);
-  Serial.println("🎙 Audio active | caller: " + incomingCallerID + " | auto-end in " + String(MAX_CALL_DURATION) + "s");
+  Serial.println(" Audio active | caller: " + incomingCallerID + " | auto-end in " + String(MAX_CALL_DURATION) + "s");
 }
 
 void hangupCall() {
@@ -1158,6 +1207,13 @@ void printGPSStatus() {
 // ─────────────────────────────────────────────────────────────────────────────
 void sendToGeolinkerViaGPRS() {
   if (!gpsFixed || !gprsConnected) return;
+
+
+  // Safety guard — never touch HTTP stack during a voice call
+  if (callInProgress) {
+    Serial.println("Upload skipped — call in progress");
+    return;
+  }
 
   Serial.println("\n=== Geolinker Upload ===");
 
